@@ -6731,6 +6731,44 @@ func TestGenerateManifest_OCISourceSkipsGitClient(t *testing.T) {
 	assert.False(t, gitCalled, "GenerateManifest should not invoke Git for OCI sources")
 }
 
+func TestRunRepoOperation_OCISelector(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "manifests", "dev"), 0o700))
+	client := &ocimocks.Client{}
+	client.EXPECT().ResolveRevision(mock.Anything, "v1", true).Return("parent-manifest-digest", nil).Once()
+	client.EXPECT().CleanCache("parent-manifest-digest").Return(nil).Once()
+	client.EXPECT().Extract(mock.Anything, "parent-manifest-digest").Return(root, utilio.NopCloser, nil).Once()
+	svc := newService(t, root)
+	constructed := 0
+	svc.newOCIClient = func(repoURL string, _ oci.Creds, _, _ string, _ []string, opts ...oci.ClientOpts) (oci.Client, error) {
+		constructed++
+		assert.Equal(t, "oci://example.com/bundle", repoURL)
+		assert.Len(t, opts, len(svc.ociClientStandardOpts())+1)
+		return client, nil
+	}
+	source := &v1alpha1.ApplicationSource{
+		RepoURL: "oci://example.com/bundle", TargetRevision: "v1", Path: "manifests/dev",
+		OCI: &v1alpha1.ApplicationSourceOCI{LayerSelector: &v1alpha1.OCILayerSelector{Annotations: map[string]string{"config": "true"}}},
+	}
+	called := false
+	err := svc.runRepoOperation(t.Context(), "", &v1alpha1.Repository{Repo: source.RepoURL}, source, nil,
+		func(string, cache.ResolvedRevisions, bool) (bool, error) { return false, nil },
+		func(repoRoot, commitSHA, revision string, ctxSrc operationContextSrc) error {
+			called = true
+			assert.Equal(t, root, repoRoot)
+			assert.Equal(t, "parent-manifest-digest", commitSHA)
+			assert.Equal(t, "parent-manifest-digest", revision)
+			ctx, err := ctxSrc()
+			require.NoError(t, err)
+			assert.Equal(t, filepath.Join(root, "manifests", "dev"), ctx.appPath)
+			return nil
+		}, operationSettings{noCache: true}, true, nil)
+	require.NoError(t, err)
+	assert.True(t, called)
+	assert.Equal(t, 1, constructed)
+	client.AssertExpectations(t)
+}
+
 func TestGetHelmRepos_InsecureOCIForceHttpPropagatedFromRepo(t *testing.T) {
 	q := apiclient.ManifestRequest{
 		Repos: []*v1alpha1.Repository{{

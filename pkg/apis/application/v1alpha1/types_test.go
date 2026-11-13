@@ -1648,6 +1648,67 @@ func TestExplicitTypeWithDirectory(t *testing.T) {
 	require.Error(t, err, "cannot add directory with any other types")
 }
 
+func TestApplicationSource_OCITransport(t *testing.T) {
+	for _, renderer := range []ApplicationSource{
+		{},
+		{Helm: &ApplicationSourceHelm{}},
+		{Kustomize: &ApplicationSourceKustomize{}},
+		{Directory: &ApplicationSourceDirectory{}},
+		{Plugin: &ApplicationSourcePlugin{}},
+	} {
+		expected, err := renderer.ExplicitType()
+		require.NoError(t, err)
+		renderer.RepoURL = "oci://example.com/bundle"
+		renderer.OCI = &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{Annotations: map[string]string{"config": "true"}}}
+		actual, err := renderer.ExplicitType()
+		require.NoError(t, err)
+		assert.Equal(t, expected, actual)
+		assert.True(t, renderer.IsOCI())
+	}
+}
+
+func TestAppSourceEquality_OCI(t *testing.T) {
+	source := &ApplicationSource{OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{
+		MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+		Annotations: map[string]string{"config": "true", "environment": "dev"},
+	}}}
+	other := &ApplicationSource{OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{
+		MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+		Annotations: map[string]string{"environment": "dev", "config": "true"},
+	}}}
+	assert.True(t, source.Equals(other))
+	assert.True(t, ApplicationSources{*source}.Equals(ApplicationSources{*other}))
+	other.OCI.LayerSelector.Annotations["environment"] = "prod"
+	assert.False(t, source.Equals(other))
+	assert.False(t, ApplicationSources{*source}.Equals(ApplicationSources{*other}))
+	other.OCI.LayerSelector.Annotations["environment"] = "dev"
+	other.OCI.LayerSelector.MediaType = "application/vnd.oci.image.layer.v1.tar"
+	assert.False(t, source.Equals(other))
+	assert.False(t, source.Equals(&ApplicationSource{}))
+	assert.True(t, (&ApplicationSource{}).Equals(&ApplicationSource{OCI: &ApplicationSourceOCI{}}))
+	assert.False(t, (&ApplicationSource{}).Equals(&ApplicationSource{OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{}}}))
+	source.OCI.LayerSelector.Annotations = nil
+	other.OCI.LayerSelector = &OCILayerSelector{MediaType: source.OCI.LayerSelector.MediaType, Annotations: map[string]string{}}
+	assert.True(t, source.Equals(other))
+}
+
+func TestApplicationSource_OCIJSONRoundTrip(t *testing.T) {
+	source := ApplicationSource{
+		RepoURL: "oci://example.com/bundle", Path: "manifests/dev", TargetRevision: "v1",
+		OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{
+			MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+			Annotations: map[string]string{"config": "true", "empty": ""},
+		}},
+	}
+	for _, spec := range []ApplicationSpec{{Source: &source}, {Sources: ApplicationSources{source}}} {
+		data, err := json.Marshal(spec)
+		require.NoError(t, err)
+		var actual ApplicationSpec
+		require.NoError(t, json.Unmarshal(data, &actual))
+		assert.Equal(t, spec, actual)
+	}
+}
+
 func TestAppSourceEquality(t *testing.T) {
 	left := &ApplicationSource{
 		Directory: &ApplicationSourceDirectory{
@@ -2240,6 +2301,9 @@ func TestApplicationSource_IsZero(t *testing.T) {
 		{"Kustomize", &ApplicationSource{Kustomize: &ApplicationSourceKustomize{Images: KustomizeImages{""}}}, false},
 		{"Directory", &ApplicationSource{Directory: &ApplicationSourceDirectory{Recurse: true}}, false},
 		{"Plugin", &ApplicationSource{Plugin: &ApplicationSourcePlugin{Name: "foo"}}, false},
+		{"EmptyOCI", &ApplicationSource{OCI: &ApplicationSourceOCI{}}, true},
+		{"EmptyOCISelector", &ApplicationSource{OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{}}}, false},
+		{"OCISelector", &ApplicationSource{OCI: &ApplicationSourceOCI{LayerSelector: &OCILayerSelector{Annotations: map[string]string{"config": "true"}}}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

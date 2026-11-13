@@ -1,7 +1,9 @@
 package repos
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,13 +11,17 @@ import (
 	"strings"
 	"testing"
 
+	imagev1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"oras.land/oras-go/v2/content"
+	"oras.land/oras-go/v2/registry/remote"
 
 	"github.com/argoproj/argo-cd/v3/common"
 	"github.com/argoproj/argo-cd/v3/test/e2e/fixture"
 	"github.com/argoproj/argo-cd/v3/util/errors"
+	"github.com/argoproj/argo-cd/v3/util/io/files"
 )
 
 func CertPath(t *testing.T) string {
@@ -315,6 +321,45 @@ func PushImageToOCIRegistry(t *testing.T, pathName, tag string, pushPath ...stri
 		fmt.Sprintf("%s:%s", fmt.Sprintf("%s/%s", strings.TrimPrefix(fixture.OCIHostURL, "oci://"), filepath.Base(pathName)), tag),
 		pathToPush,
 	))
+}
+
+type OCILayer struct {
+	Path        string
+	Annotations map[string]string
+}
+
+// PushMultiLayerImageToOCIRegistry archives each layer separately and returns the parent manifest digest.
+func PushMultiLayerImageToOCIRegistry(t *testing.T, imagePath, tag string, layers ...OCILayer) string {
+	t.Helper()
+	repo, err := remote.NewRepository(strings.TrimPrefix(fixture.OCIHostURL, "oci://") + "/" + imagePath)
+	require.NoError(t, err)
+	repo.PlainHTTP = true
+
+	configBlob := []byte("{}")
+	configDesc := content.NewDescriptorFromBytes(imagev1.MediaTypeImageConfig, configBlob)
+	require.NoError(t, repo.Push(t.Context(), configDesc, bytes.NewReader(configBlob)))
+
+	layerDescs := make([]imagev1.Descriptor, 0, len(layers))
+	for _, layer := range layers {
+		var blob bytes.Buffer
+		_, err := files.Tgz(layer.Path, nil, nil, &blob)
+		require.NoError(t, err)
+		desc := content.NewDescriptorFromBytes(imagev1.MediaTypeImageLayerGzip, blob.Bytes())
+		desc.Annotations = layer.Annotations
+		require.NoError(t, repo.Push(t.Context(), desc, bytes.NewReader(blob.Bytes())))
+		layerDescs = append(layerDescs, desc)
+	}
+
+	manifestBlob, err := json.Marshal(imagev1.Manifest{
+		SchemaVersion: 2,
+		MediaType:     imagev1.MediaTypeImageManifest,
+		Config:        configDesc,
+		Layers:        layerDescs,
+	})
+	require.NoError(t, err)
+	manifestDesc := content.NewDescriptorFromBytes(imagev1.MediaTypeImageManifest, manifestBlob)
+	require.NoError(t, repo.PushReference(t.Context(), manifestDesc, bytes.NewReader(manifestBlob), tag))
+	return manifestDesc.Digest.String()
 }
 
 // PushImageToAuthenticatedOCIRegistry adds a helm chart to helm OCI registry

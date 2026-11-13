@@ -21,6 +21,7 @@ import (
 
 	securejoin "github.com/cyphar/filepath-securejoin"
 	imagev1 "github.com/opencontainers/image-spec/specs-go/v1"
+	orascontent "oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/oci"
 
 	"github.com/argoproj/argo-cd/v3/util/versions"
@@ -98,6 +99,25 @@ type Creds struct {
 }
 
 type ClientOpts func(c *nativeOCIClient)
+
+type LayerSelector struct {
+	MediaType   string            `json:"mediaType,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+func WithLayerSelector(selector *LayerSelector) ClientOpts {
+	return func(c *nativeOCIClient) {
+		if selector != nil {
+			c.layerSelector = &LayerSelector{MediaType: selector.MediaType}
+			if selector.Annotations != nil {
+				c.layerSelector.Annotations = make(map[string]string, len(selector.Annotations))
+				for key, value := range selector.Annotations {
+					c.layerSelector.Annotations[key] = value
+				}
+			}
+		}
+	}
+}
 
 func WithIndexCache(indexCache tagsCache) ClientOpts {
 	return func(c *nativeOCIClient) {
@@ -231,6 +251,7 @@ type nativeOCIClient struct {
 	manifestMaxExtractedSize        int64
 	disableManifestMaxExtractedSize bool
 	pingFunc                        func(ctx context.Context) error
+	layerSelector                   *LayerSelector
 }
 
 // TestRepo verifies that the remote OCI repo can be connected to.
@@ -273,6 +294,7 @@ func (c *nativeOCIClient) extract(ctx context.Context, digest string) (string, u
 	}
 
 	var isHelmChart bool
+	var selectedLayer *imagev1.Descriptor
 
 	if !exists {
 		ociManifest, err := getOCIManifest(ctx, digest, c.repo)
@@ -282,38 +304,45 @@ func (c *nativeOCIClient) extract(ctx context.Context, digest string) (string, u
 
 		// Add a guard to defend against a ridiculous amount of layers. No idea what a good amount is, but normally we
 		// shouldn't expect more than 2-3 in most real world use cases.
-		if len(ociManifest.Layers) > 10 {
+		if c.layerSelector == nil && len(ociManifest.Layers) > 10 {
 			return "", nil, fmt.Errorf("expected no more than 10 oci layers, got %d", len(ociManifest.Layers))
 		}
 
-		isHelmChart = ociManifest.Config.MediaType == helmOCIConfigType
+		if c.layerSelector != nil {
+			selectedLayer, err = c.selectLayer(ociManifest)
+			if err != nil {
+				return "", nil, err
+			}
+		} else {
+			isHelmChart = ociManifest.Config.MediaType == helmOCIConfigType
 
-		contentLayers := 0
+			contentLayers := 0
 
-		// Strictly speaking we only allow for a single content layer. There are images which contains extra layers, such
-		// as provenance/attestation layers. Pending a better story to do this natively, we will skip such layers for now.
-		for _, layer := range ociManifest.Layers {
-			// For Helm charts, only look for the specific Helm chart content layer
-			if isHelmChart {
-				if isHelmOCI(layer.MediaType) {
+			// Strictly speaking we only allow for a single content layer. There are images which contains extra layers, such
+			// as provenance/attestation layers. Pending a better story to do this natively, we will skip such layers for now.
+			for _, layer := range ociManifest.Layers {
+				// For Helm charts, only look for the specific Helm chart content layer
+				if isHelmChart {
+					if isHelmOCI(layer.MediaType) {
+						if !slices.Contains(c.allowedMediaTypes, layer.MediaType) {
+							return "", nil, fmt.Errorf("oci layer media type %s is not in the list of allowed media types", layer.MediaType)
+						}
+						contentLayers++
+					}
+				} else if isContentLayer(layer.MediaType) {
 					if !slices.Contains(c.allowedMediaTypes, layer.MediaType) {
 						return "", nil, fmt.Errorf("oci layer media type %s is not in the list of allowed media types", layer.MediaType)
 					}
 					contentLayers++
 				}
-			} else if isContentLayer(layer.MediaType) {
-				if !slices.Contains(c.allowedMediaTypes, layer.MediaType) {
-					return "", nil, fmt.Errorf("oci layer media type %s is not in the list of allowed media types", layer.MediaType)
-				}
-				contentLayers++
+			}
+
+			if contentLayers != 1 {
+				return "", nil, fmt.Errorf("expected only a single oci content layer, got %d", contentLayers)
 			}
 		}
 
-		if contentLayers != 1 {
-			return "", nil, fmt.Errorf("expected only a single oci content layer, got %d", contentLayers)
-		}
-
-		err = saveCompressedImageToPath(ctx, digest, c.repo, cachedPath)
+		err = saveCompressedImageToPath(ctx, digest, c.repo, cachedPath, layerCopyOptions(digest, selectedLayer))
 		if err != nil {
 			return "", nil, fmt.Errorf("could not save oci digest %s: %w", digest, err)
 		}
@@ -324,15 +353,22 @@ func (c *nativeOCIClient) extract(ctx context.Context, digest string) (string, u
 		maxSize = math.MaxInt64
 	}
 
-	if !isHelmChart {
-		// Get the manifest to determine if it's a Helm chart for extraction
+	if !isHelmChart || c.layerSelector != nil {
+		// Revalidate selectors against the original cached manifest, including on cache hits.
 		ociManifest, err := getOCIManifestFromCache(ctx, cachedPath, digest)
 		if err != nil {
 			return "", nil, fmt.Errorf("error getting oci manifest for extraction: %w", err)
 		}
-		isHelmChart = ociManifest.Config.MediaType == helmOCIConfigType
+		if c.layerSelector != nil {
+			selectedLayer, err = c.selectLayer(ociManifest)
+			if err != nil {
+				return "", nil, err
+			}
+		} else {
+			isHelmChart = ociManifest.Config.MediaType == helmOCIConfigType
+		}
 	}
-	manifestsDir, err := extractContentToManifestsDir(ctx, cachedPath, digest, maxSize, isHelmChart)
+	manifestsDir, err := extractContentToManifestsDir(ctx, cachedPath, digest, maxSize, isHelmChart, layerCopyOptions(digest, selectedLayer))
 	if err != nil {
 		return manifestsDir, nil, fmt.Errorf("cannot extract contents of oci image with revision %s: %w", digest, err)
 	}
@@ -343,11 +379,73 @@ func (c *nativeOCIClient) extract(ctx context.Context, digest string) (string, u
 }
 
 func (c *nativeOCIClient) getCachedPath(version string) (string, error) {
-	keyData, err := json.Marshal(map[string]string{"url": c.repoURL, "version": version})
+	key := map[string]string{"url": c.repoURL, "version": version}
+	if c.layerSelector != nil {
+		selector, err := json.Marshal(c.layerSelector)
+		if err != nil {
+			return "", err
+		}
+		key["layerSelector"] = string(selector)
+	}
+	keyData, err := json.Marshal(key)
 	if err != nil {
 		return "", err
 	}
 	return c.repoCachePaths.GetPath(string(keyData))
+}
+
+func (c *nativeOCIClient) selectLayer(manifest *imagev1.Manifest) (*imagev1.Descriptor, error) {
+	selector := c.layerSelector
+	if selector.MediaType == "" && len(selector.Annotations) == 0 {
+		return nil, errors.New("oci layer selector must specify mediaType or annotations")
+	}
+	var selected *imagev1.Descriptor
+	matches := 0
+	for _, layer := range manifest.Layers {
+		if selector.MediaType != "" && selector.MediaType != layer.MediaType {
+			continue
+		}
+		matchesAnnotations := true
+		for key, value := range selector.Annotations {
+			actual, present := layer.Annotations[key]
+			if !present || actual != value {
+				matchesAnnotations = false
+				break
+			}
+		}
+		if matchesAnnotations {
+			matches++
+			selected = &layer
+		}
+	}
+	if matches != 1 {
+		return nil, fmt.Errorf("oci layer selector must match exactly one layer, got %d; refine mediaType or annotations", matches)
+	}
+	if !isContentLayer(selected.MediaType) {
+		return nil, fmt.Errorf("selected oci layer media type %s is not a supported archive format", selected.MediaType)
+	}
+	if !slices.Contains(c.allowedMediaTypes, selected.MediaType) {
+		return nil, fmt.Errorf("oci layer media type %s is not in the list of allowed media types", selected.MediaType)
+	}
+	return selected, nil
+}
+
+func layerCopyOptions(digest string, selected *imagev1.Descriptor) oras.CopyOptions {
+	opts := oras.DefaultCopyOptions
+	if selected != nil {
+		// Partial caches keep the original manifest, but deliberately omit its other dependencies.
+		// Use the same traversal for download and warm-cache extraction.
+		opts.FindSuccessors = func(_ context.Context, _ orascontent.Fetcher, desc imagev1.Descriptor) ([]imagev1.Descriptor, error) {
+		if desc.Digest.String() == digest {
+				if desc.MediaType != imagev1.MediaTypeImageManifest && desc.MediaType != "application/vnd.docker.distribution.manifest.v2+json" {
+					return nil, fmt.Errorf("oci layer selection requires an image manifest, got %s", desc.MediaType)
+				}
+				return []imagev1.Descriptor{*selected}, nil
+			}
+			return nil, nil
+		}
+	}
+	return opts
 }
 
 func (c *nativeOCIClient) CleanCache(revision string) error {
@@ -544,7 +642,7 @@ func createTarFile(from, to string) error {
 }
 
 // saveCompressedImageToPath downloads a remote OCI image on a given digest and stores it as a TAR file in cachedPath.
-func saveCompressedImageToPath(ctx context.Context, digest string, repo oras.ReadOnlyTarget, cachedPath string) error {
+func saveCompressedImageToPath(ctx context.Context, digest string, repo oras.ReadOnlyTarget, cachedPath string, opts oras.CopyOptions) error {
 	tempDir, err := files.CreateTempDir(os.TempDir())
 	if err != nil {
 		return err
@@ -557,7 +655,7 @@ func saveCompressedImageToPath(ctx context.Context, digest string, repo oras.Rea
 	}
 
 	// Copy remote repo at the given digest to the scratch dir.
-	if _, err = oras.Copy(ctx, repo, digest, store, digest, oras.DefaultCopyOptions); err != nil {
+	if _, err = oras.Copy(ctx, repo, digest, store, digest, opts); err != nil {
 		return err
 	}
 
@@ -573,11 +671,17 @@ func saveCompressedImageToPath(ctx context.Context, digest string, repo oras.Rea
 
 // extractContentToManifestsDir looks up a locally stored OCI image, and extracts the embedded compressed layer which contains
 // K8s manifests to a temp dir.
-func extractContentToManifestsDir(ctx context.Context, cachedPath, digest string, maxSize int64, isHelmChart bool) (string, error) {
-	manifestsDir, err := files.CreateTempDir(os.TempDir())
+func extractContentToManifestsDir(ctx context.Context, cachedPath, digest string, maxSize int64, isHelmChart bool, opts oras.CopyOptions) (manifestsDir string, err error) {
+	manifestsDir, err = files.CreateTempDir(os.TempDir())
 	if err != nil {
 		return manifestsDir, err
 	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(manifestsDir)
+			manifestsDir = ""
+		}
+	}()
 
 	ociReadOnlyStore, err := oci.NewFromTar(ctx, cachedPath)
 	if err != nil {
@@ -595,17 +699,20 @@ func extractContentToManifestsDir(ctx context.Context, cachedPath, digest string
 		return manifestsDir, err
 	}
 	defer fs.Close()
+	fs.verifyContent = opts.FindSuccessors != nil
+	fs.ForceCAS = fs.verifyContent
 
-	// copies the whole artifact to the tempdir, here compressedLayerFileStore.Push will be called
-	_, err = oras.Copy(ctx, ociReadOnlyStore, digest, fs, digest, oras.DefaultCopyOptions)
+	// Copy only the configured graph; Push extracts its content layers.
+	_, err = oras.Copy(ctx, ociReadOnlyStore, digest, fs, digest, opts)
 	return manifestsDir, err
 }
 
 type compressedLayerExtracterStore struct {
 	*file.Store
-	dest        string
-	maxSize     int64
-	isHelmChart bool
+	dest          string
+	maxSize       int64
+	isHelmChart   bool
+	verifyContent bool
 }
 
 func newCompressedLayerFileStore(dest, tempDir string, maxSize int64, isHelmChart bool) (*compressedLayerExtracterStore, error) {
@@ -614,7 +721,7 @@ func newCompressedLayerFileStore(dest, tempDir string, maxSize int64, isHelmChar
 		return nil, err
 	}
 
-	return &compressedLayerExtracterStore{f, dest, maxSize, isHelmChart}, nil
+	return &compressedLayerExtracterStore{Store: f, dest: dest, maxSize: maxSize, isHelmChart: isHelmChart}, nil
 }
 
 func isHelmOCI(mediaType string) bool {
@@ -630,6 +737,11 @@ func (s *compressedLayerExtracterStore) Push(ctx context.Context, desc imagev1.D
 	}
 
 	if isContentLayer(desc.MediaType) {
+		var verifiedContent *orascontent.VerifyReader
+		if s.verifyContent {
+			verifiedContent = orascontent.NewVerifyReader(content, desc)
+			content = verifiedContent
+		}
 		srcDir, err := files.CreateTempDir(os.TempDir())
 		if err != nil {
 			return err
@@ -644,6 +756,14 @@ func (s *compressedLayerExtracterStore) Push(ctx context.Context, desc imagev1.D
 
 		if err != nil {
 			return fmt.Errorf("could not decompress layer: %w", err)
+		}
+		if verifiedContent != nil {
+			if _, err := io.Copy(io.Discard, verifiedContent); err != nil {
+				return fmt.Errorf("could not verify selected layer: %w", err)
+			}
+			if err := verifiedContent.Verify(); err != nil {
+				return fmt.Errorf("could not verify selected layer: %w", err)
+			}
 		}
 
 		if isHelmOCI(desc.MediaType) {

@@ -689,6 +689,23 @@ func GetRefSources(ctx context.Context, sources argoappv1.ApplicationSources, pr
 
 func validateSourcePermissions(source argoappv1.ApplicationSource, hasMultipleSources bool) []argoappv1.ApplicationCondition {
 	var conditions []argoappv1.ApplicationCondition
+	if !source.OCI.IsZero() {
+		if !source.IsOCI() {
+			conditions = append(conditions, argoappv1.ApplicationCondition{
+				Type:    argoappv1.ApplicationConditionInvalidSpecError,
+				Message: "spec.source.oci options are only supported for native OCI sources (oci:// repoURL)",
+			})
+			return conditions
+		}
+		selector := source.OCI.LayerSelector
+		if selector.MediaType == "" && len(selector.Annotations) == 0 {
+			conditions = append(conditions, argoappv1.ApplicationCondition{
+				Type:    argoappv1.ApplicationConditionInvalidSpecError,
+				Message: "spec.source.oci.layerSelector must specify mediaType or annotations",
+			})
+			return conditions
+		}
+	}
 	if hasMultipleSources {
 		if source.RepoURL == "" || (source.Path == "" && source.Chart == "" && source.Ref == "") {
 			conditions = append(conditions, argoappv1.ApplicationCondition{
@@ -1142,6 +1159,9 @@ func NormalizeApplicationSpec(spec *argoappv1.ApplicationSpec) *argoappv1.Applic
 }
 
 func NormalizeSource(source *argoappv1.ApplicationSource) *argoappv1.ApplicationSource {
+	if source.OCI != nil && source.OCI.IsZero() {
+		source.OCI = nil
+	}
 	// 3. If any app sources are their zero values, then nil out the pointers to the source spec.
 	// This makes it easier for users to switch between app source types if they are not using
 	// any of the source-specific parameters.

@@ -350,6 +350,74 @@ func TestValidatePermissionsEmptyDestination(t *testing.T) {
 	assert.ElementsMatch(t, conditions, []argoappv1.ApplicationCondition{{Type: argoappv1.ApplicationConditionInvalidSpecError, Message: "Destination server missing from app spec"}})
 }
 
+func TestValidateSourcePermissions_OCI(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		repoURL string
+		chart   string
+		options *argoappv1.ApplicationSourceOCI
+		wantErr string
+	}{
+		{name: "selectorless", repoURL: "oci://example.com/bundle"},
+		{name: "empty options", repoURL: "oci://example.com/bundle", options: &argoappv1.ApplicationSourceOCI{}},
+		{name: "empty options on git", repoURL: "https://example.com/repo.git", options: &argoappv1.ApplicationSourceOCI{}},
+		{name: "media type", repoURL: "oci://example.com/bundle", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip"}}},
+		{name: "annotations", repoURL: "oci://example.com/bundle", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{Annotations: map[string]string{"config": ""}}}},
+		{name: "empty selector", repoURL: "oci://example.com/bundle", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{}}, wantErr: "spec.source.oci.layerSelector must specify mediaType or annotations"},
+		{name: "empty annotations", repoURL: "oci://example.com/bundle", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{Annotations: map[string]string{}}}, wantErr: "spec.source.oci.layerSelector must specify mediaType or annotations"},
+		{name: "git", repoURL: "https://example.com/repo.git", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{MediaType: "layer"}}, wantErr: "spec.source.oci options are only supported for native OCI sources (oci:// repoURL)"},
+		{name: "legacy helm OCI", repoURL: "example.com/charts", chart: "my-chart", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{MediaType: "layer"}}, wantErr: "spec.source.oci options are only supported for native OCI sources (oci:// repoURL)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := argoappv1.ApplicationSource{RepoURL: tt.repoURL, Path: ".", Chart: tt.chart, TargetRevision: "v1", OCI: tt.options}
+			for _, multiple := range []bool{false, true} {
+				conditions := validateSourcePermissions(source, multiple)
+				if tt.wantErr == "" {
+					assert.Empty(t, conditions)
+				} else {
+					require.Len(t, conditions, 1)
+					assert.Equal(t, argoappv1.ApplicationConditionInvalidSpecError, conditions[0].Type)
+					assert.Equal(t, tt.wantErr, conditions[0].Message)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeSource_OCI(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		options *argoappv1.ApplicationSourceOCI
+	}{
+		{name: "absent"},
+		{name: "empty options", options: &argoappv1.ApplicationSourceOCI{}},
+		{name: "empty selector retained", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{}}},
+		{name: "selector retained", options: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{Annotations: map[string]string{"config": "true"}}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := &argoappv1.ApplicationSource{RepoURL: "oci://example.com/bundle", Path: ".", OCI: tt.options}
+			NormalizeSource(source)
+			if tt.options.IsZero() {
+				assert.Nil(t, source.OCI)
+			} else {
+				assert.Same(t, tt.options, source.OCI)
+			}
+		})
+	}
+}
+
+func TestValidatePermissions_OCIInMultipleSources(t *testing.T) {
+	spec := &argoappv1.ApplicationSpec{Sources: argoappv1.ApplicationSources{
+		{RepoURL: "https://example.com/repo.git", Path: "."},
+		{RepoURL: "oci://example.com/bundle", Path: ".", OCI: &argoappv1.ApplicationSourceOCI{LayerSelector: &argoappv1.OCILayerSelector{}}},
+	}}
+	project := &argoappv1.AppProject{Spec: argoappv1.AppProjectSpec{SourceRepos: []string{"*"}}}
+	conditions, err := ValidatePermissions(t.Context(), spec, project, nil)
+	require.NoError(t, err)
+	require.Len(t, conditions, 1)
+	assert.Equal(t, "spec.source.oci.layerSelector must specify mediaType or annotations", conditions[0].Message)
+}
+
 func TestValidateChartWithoutRevision(t *testing.T) {
 	t.Parallel()
 	appSpec := &argoappv1.ApplicationSpec{

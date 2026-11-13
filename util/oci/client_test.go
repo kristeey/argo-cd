@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/memory"
+	ocistore "oras.land/oras-go/v2/content/oci"
 
 	utilio "github.com/argoproj/argo-cd/v3/util/io"
 	"github.com/argoproj/argo-cd/v3/util/io/files"
@@ -117,6 +119,14 @@ func (l observingOCIKeyLock) Lock(key string) {
 }
 
 func Test_nativeOCIClient_CleanCacheWaitsForExtraction(t *testing.T) {
+	t.Run("selectorless", func(t *testing.T) { testCleanCacheWaitsForExtraction(t, nil) })
+	t.Run("selected layer", func(t *testing.T) {
+		testCleanCacheWaitsForExtraction(t, &LayerSelector{MediaType: imagev1.MediaTypeImageLayerGzip})
+	})
+}
+
+func testCleanCacheWaitsForExtraction(t *testing.T, selector *LayerSelector) {
+	t.Helper()
 	store := memory.New()
 	layer := createGzippedTarWithContent(t, "deployment.yaml", "some content")
 	revision := generateManifest(t, store, layerConf{content.NewDescriptorFromBytes(imagev1.MediaTypeImageLayerGzip, layer), layer})
@@ -135,7 +145,7 @@ func Test_nativeOCIClient_CleanCacheWaitsForExtraction(t *testing.T) {
 			<-resumeExtraction
 		},
 	}, store, nil, nil, []string{imagev1.MediaTypeImageLayerGzip},
-		WithImagePaths(cachePaths), WithManifestMaxExtractedSize(1000), WithEventHandlers(fakeEventHandlers(t, repoURL)))
+		WithImagePaths(cachePaths), WithManifestMaxExtractedSize(1000), WithLayerSelector(selector), WithEventHandlers(fakeEventHandlers(t, repoURL)))
 	cleaner := &nativeOCIClient{
 		repoURL: repoURL,
 		repoLock: observingOCIKeyLock{
@@ -143,10 +153,17 @@ func Test_nativeOCIClient_CleanCacheWaitsForExtraction(t *testing.T) {
 			beforeLock: func(key string) { cleanupLockAttempt <- key },
 		},
 		repoCachePaths: cachePaths,
+		layerSelector:  selector,
 	}
 	cachePath, err := cleaner.getCachedPath(revision)
 	require.NoError(t, err)
-	require.NoError(t, saveCompressedImageToPath(t.Context(), revision, store, cachePath))
+	var selected *imagev1.Descriptor
+	if selector != nil {
+		manifest, err := getOCIManifest(t.Context(), revision, store)
+		require.NoError(t, err)
+		selected = &manifest.Layers[0]
+	}
+	require.NoError(t, saveCompressedImageToPath(t.Context(), revision, store, cachePath, layerCopyOptions(revision, selected)))
 
 	extracted := make(chan error, 1)
 	go func() {
@@ -178,6 +195,241 @@ func Test_nativeOCIClient_CleanCacheWaitsForExtraction(t *testing.T) {
 	releaseExtraction()
 	require.NoError(t, <-cleaned)
 	require.NoFileExists(t, cachePath)
+}
+
+func Test_nativeOCIClient_SelectLayer(t *testing.T) {
+	archive := imagev1.MediaTypeImageLayerGzip
+	layers := []imagev1.Descriptor{
+		{MediaType: archive, Annotations: map[string]string{"role": "config", "empty": "", "extra": "allowed"}},
+		{MediaType: archive, Annotations: map[string]string{"role": "runtime"}},
+		{MediaType: helmOCILayerType, Annotations: map[string]string{"role": "chart"}},
+		{MediaType: "application/json", Annotations: map[string]string{"role": "metadata"}},
+	}
+	for _, tt := range []struct {
+		name     string
+		selector LayerSelector
+		want     int
+		err      string
+	}{
+		{name: "media type", selector: LayerSelector{MediaType: helmOCILayerType}, want: 2},
+		{name: "annotations", selector: LayerSelector{Annotations: map[string]string{"role": "config"}}, want: 0},
+		{name: "combined", selector: LayerSelector{MediaType: archive, Annotations: map[string]string{"role": "runtime"}}, want: 1},
+		{name: "present empty annotation", selector: LayerSelector{Annotations: map[string]string{"empty": ""}}, want: 0},
+		{name: "missing empty annotation", selector: LayerSelector{Annotations: map[string]string{"missing": ""}}, err: "got 0"},
+		{name: "all annotations required", selector: LayerSelector{Annotations: map[string]string{"role": "config", "extra": "wrong"}}, err: "got 0"},
+		{name: "criteria use AND", selector: LayerSelector{MediaType: helmOCILayerType, Annotations: map[string]string{"role": "config"}}, err: "got 0"},
+		{name: "ambiguous", selector: LayerSelector{MediaType: archive}, err: "got 2"},
+		{name: "unsupported", selector: LayerSelector{Annotations: map[string]string{"role": "metadata"}}, err: "not a supported archive format"},
+		{name: "empty", err: "must specify mediaType or annotations"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &nativeOCIClient{layerSelector: &tt.selector, allowedMediaTypes: []string{archive, helmOCILayerType}}
+			selected, err := c.selectLayer(&imagev1.Manifest{Layers: layers})
+			if tt.err != "" {
+				require.ErrorContains(t, err, tt.err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, layers[tt.want], *selected)
+			c.allowedMediaTypes = nil
+			_, err = c.selectLayer(&imagev1.Manifest{Layers: layers})
+			require.ErrorContains(t, err, "not in the list of allowed media types")
+		})
+	}
+}
+
+type selectiveFetchTarget struct {
+	oras.ReadOnlyTarget
+	mu        sync.Mutex
+	forbidden map[digest.Digest]bool
+	fetched   map[digest.Digest]int
+}
+
+func (s *selectiveFetchTarget) Fetch(ctx context.Context, desc imagev1.Descriptor) (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fetched[desc.Digest]++
+	if s.forbidden[desc.Digest] {
+		return nil, errors.New("unselected blob must not be fetched")
+	}
+	return s.ReadOnlyTarget.Fetch(ctx, desc)
+}
+
+func Test_nativeOCIClient_SelectedLayerCache(t *testing.T) {
+	store := memory.New()
+	var layers []layerConf
+	for _, role := range []string{"config", "runtime"} {
+		blob := createGzippedTarWithContent(t, "manifests/dev/deployment.yaml", role)
+		desc := content.NewDescriptorFromBytes(imagev1.MediaTypeImageLayerGzip, blob)
+		desc.Annotations = map[string]string{"role": role, "empty": ""}
+		layers = append(layers, layerConf{desc, blob})
+	}
+	// More than ten descriptors is valid with a selector; the extra blobs are never needed.
+	for i := range 11 {
+		blob := fmt.Appendf(nil, "unrelated metadata %d", i)
+		layers = append(layers, layerConf{content.NewDescriptorFromBytes("application/json", blob), blob})
+	}
+	revision := generateManifest(t, store, layers...)
+	manifest, err := getOCIManifest(t.Context(), revision, store)
+	require.NoError(t, err)
+	target := &selectiveFetchTarget{ReadOnlyTarget: store, forbidden: map[digest.Digest]bool{}, fetched: map[digest.Digest]int{}}
+	target.forbidden[manifest.Config.Digest] = true
+	for _, layer := range layers[1:] {
+		target.forbidden[layer.desc.Digest] = true
+	}
+	const repoURL = "oci://example.com/bundle"
+	cachePaths := utilio.NewRandomizedTempPaths(t.TempDir())
+	lock := keysync.NewKeyLock()
+	selector := &LayerSelector{Annotations: map[string]string{"role": "config", "empty": ""}}
+	c := newClientWithLock(repoURL, lock, target, nil, nil, []string{imagev1.MediaTypeImageLayerGzip},
+		WithImagePaths(cachePaths), WithManifestMaxExtractedSize(1000), WithLayerSelector(selector), WithEventHandlers(fakeEventHandlers(t, repoURL))).(*nativeOCIClient)
+	selector.Annotations["role"] = "mutated after construction"
+	for range 2 {
+		dir, closer, err := c.Extract(t.Context(), revision)
+		require.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(dir, "manifests/dev/deployment.yaml"))
+		require.NoError(t, err)
+		require.Equal(t, "config", string(got))
+		require.NoError(t, closer.Close())
+		require.NoDirExists(t, dir)
+	}
+	require.Equal(t, 1, target.fetched[layers[0].desc.Digest])
+	c.allowedMediaTypes = nil
+	dir, closer, err := c.Extract(t.Context(), revision)
+	require.ErrorContains(t, err, "not in the list of allowed media types")
+	require.Empty(t, dir)
+	require.Nil(t, closer)
+	c.allowedMediaTypes = []string{imagev1.MediaTypeImageLayerGzip}
+	cachePath, err := c.getCachedPath(revision)
+	require.NoError(t, err)
+	archive, err := ocistore.NewFromTar(t.Context(), cachePath)
+	require.NoError(t, err)
+	cachedManifest, err := getOCIManifest(t.Context(), revision, archive)
+	require.NoError(t, err)
+	require.Equal(t, manifest, cachedManifest)
+	for _, desc := range append([]imagev1.Descriptor{manifest.Config}, manifest.Layers[1:]...) {
+		exists, err := archive.Exists(t.Context(), desc)
+		require.NoError(t, err)
+		require.False(t, exists)
+		require.Zero(t, target.fetched[desc.Digest])
+	}
+
+	other := newClientWithLock(repoURL, lock, store, nil, nil, []string{imagev1.MediaTypeImageLayerGzip},
+		WithImagePaths(cachePaths), WithManifestMaxExtractedSize(1000), WithLayerSelector(&LayerSelector{Annotations: map[string]string{"role": "runtime"}}), WithEventHandlers(fakeEventHandlers(t, repoURL))).(*nativeOCIClient)
+	otherPath, err := other.getCachedPath(revision)
+	require.NoError(t, err)
+	require.NotEqual(t, cachePath, otherPath)
+	for range 2 {
+		dir, closer, err := other.Extract(t.Context(), revision)
+		require.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(dir, "manifests/dev/deployment.yaml"))
+		require.NoError(t, err)
+		require.Equal(t, "runtime", string(got))
+		require.NoError(t, closer.Close())
+	}
+	require.NoError(t, c.CleanCache(revision))
+	require.NoFileExists(t, cachePath)
+	require.FileExists(t, otherPath)
+
+	reordered := &nativeOCIClient{repoURL: repoURL, repoCachePaths: cachePaths, layerSelector: &LayerSelector{Annotations: map[string]string{"empty": "", "role": "config"}}}
+	reorderedPath, err := reordered.getCachedPath(revision)
+	require.NoError(t, err)
+	require.Equal(t, cachePath, reorderedPath)
+	selectorless := &nativeOCIClient{repoURL: repoURL, repoCachePaths: cachePaths}
+	legacyKey, err := json.Marshal(map[string]string{"url": repoURL, "version": revision})
+	require.NoError(t, err)
+	legacyPath, err := cachePaths.GetPath(string(legacyKey))
+	require.NoError(t, err)
+	actualLegacyPath, err := selectorless.getCachedPath(revision)
+	require.NoError(t, err)
+	require.Equal(t, legacyPath, actualLegacyPath)
+}
+
+func Test_nativeOCIClient_SelectedLayerExtraction(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mediaType  string
+		configType string
+		filename   string
+		linkTarget string
+		blob       []byte
+		maxSize    int64
+		disabled   bool
+		err        string
+	}{
+		{name: "helm chart", mediaType: helmOCILayerType, configType: helmOCIConfigType, filename: "chart/Chart.yaml", maxSize: 1000},
+		{name: "chart descriptor in image", mediaType: helmOCILayerType, filename: "chart/Chart.yaml", maxSize: 1000},
+		{name: "archive in helm artifact", mediaType: imagev1.MediaTypeImageLayerGzip, configType: helmOCIConfigType, filename: "deployment.yaml", maxSize: 1000},
+		{name: "uncompressed tar", mediaType: imagev1.MediaTypeImageLayer, filename: "deployment.yaml", maxSize: 1000},
+		{name: "helm requires chart root", mediaType: helmOCILayerType, filename: "Chart.yaml", maxSize: 1000, err: "expected 1 directory"},
+		{name: "size limit", mediaType: imagev1.MediaTypeImageLayerGzip, filename: "deployment.yaml", maxSize: 1, err: "could not decompress layer"},
+		{name: "disabled size limit", mediaType: imagev1.MediaTypeImageLayerGzip, filename: "deployment.yaml", maxSize: 1, disabled: true},
+		{name: "corrupted content", mediaType: imagev1.MediaTypeImageLayerGzip, blob: []byte("not gzip"), maxSize: 1000, err: "could not decompress layer"},
+		{name: "path traversal", mediaType: imagev1.MediaTypeImageLayerGzip, filename: "../escape.yaml", maxSize: 1000, err: "could not decompress layer"},
+		{name: "symlink escape", mediaType: imagev1.MediaTypeImageLayerGzip, filename: "escape", linkTarget: "../outside", maxSize: 1000, err: "could not decompress layer"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := memory.New()
+			blob := tt.blob
+			if blob == nil {
+				blob = createGzippedTarWithContent(t, tt.filename, "selected manifests")
+			}
+			if tt.linkTarget != "" {
+				var buf bytes.Buffer
+				gz := gzip.NewWriter(&buf)
+				tarWriter := tar.NewWriter(gz)
+				require.NoError(t, tarWriter.WriteHeader(&tar.Header{Name: tt.filename, Typeflag: tar.TypeSymlink, Linkname: tt.linkTarget}))
+				require.NoError(t, tarWriter.Close())
+				require.NoError(t, gz.Close())
+				blob = buf.Bytes()
+			}
+			if tt.mediaType == imagev1.MediaTypeImageLayer {
+				gz, err := gzip.NewReader(bytes.NewReader(blob))
+				require.NoError(t, err)
+				blob, err = io.ReadAll(gz)
+				require.NoError(t, err)
+				require.NoError(t, gz.Close())
+			}
+			configType := tt.configType
+			if configType == "" {
+				configType = imagev1.MediaTypeImageConfig
+			}
+			revision := generateManifestWithConfig(t, store, configType, layerConf{content.NewDescriptorFromBytes(tt.mediaType, blob), blob})
+			const repoURL = "oci://example.com/manifests"
+			c := newClientWithLock(repoURL, keysync.NewKeyLock(), store, nil, nil, []string{tt.mediaType},
+				WithImagePaths(utilio.NewRandomizedTempPaths(t.TempDir())), WithManifestMaxExtractedSize(tt.maxSize), WithDisableManifestMaxExtractedSize(tt.disabled),
+				WithLayerSelector(&LayerSelector{MediaType: tt.mediaType}), WithEventHandlers(fakeEventHandlers(t, repoURL)))
+			dir, closer, err := c.Extract(t.Context(), revision)
+			if tt.err != "" {
+				require.ErrorContains(t, err, tt.err)
+				require.Empty(t, dir)
+				require.Nil(t, closer)
+				return
+			}
+			require.NoError(t, err)
+			filename := tt.filename
+			if tt.mediaType == helmOCILayerType {
+				filename = "Chart.yaml"
+			}
+			require.FileExists(t, filepath.Join(dir, filename))
+			require.NoError(t, closer.Close())
+		})
+	}
+}
+
+func TestSelectedLayer_VerifiesDigestBeforePublishing(t *testing.T) {
+	blob := createGzippedTarWithContent(t, "deployment.yaml", "selected manifests")
+	desc := content.NewDescriptorFromBytes(imagev1.MediaTypeImageLayerGzip, blob)
+	// Changing the gzip timestamp leaves an extractable archive with a different digest.
+	blob[4] ^= 1
+	dest := t.TempDir()
+	store, err := newCompressedLayerFileStore(dest, t.TempDir(), 1000, false)
+	require.NoError(t, err)
+	defer store.Close()
+	store.verifyContent = true
+	err = store.Push(t.Context(), desc, bytes.NewReader(blob))
+	require.ErrorIs(t, err, content.ErrMismatchedDigest)
+	require.NoFileExists(t, filepath.Join(dest, "deployment.yaml"))
 }
 
 func Test_nativeOCIClient_Extract(t *testing.T) {

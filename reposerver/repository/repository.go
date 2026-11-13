@@ -379,7 +379,13 @@ func (s *Service) runRepoOperation(
 
 	switch {
 	case source.IsOCI():
-		ociClient, revision, err = s.newOCIClientResolveRevision(ctx, repo, revision, settings.noCache || settings.noRevisionCache)
+		var opts []oci.ClientOpts
+		if !source.OCI.IsZero() {
+			opts = append(opts, oci.WithLayerSelector(&oci.LayerSelector{
+				MediaType: source.OCI.LayerSelector.MediaType, Annotations: source.OCI.LayerSelector.Annotations,
+			}))
+		}
+		ociClient, revision, err = s.newOCIClientResolveRevision(ctx, repo, revision, settings.noCache || settings.noRevisionCache, opts...)
 	case source.IsHelm():
 		helmClient, revision, err = s.newHelmClientResolveRevision(ctx, repo, revision, source.Chart, settings.noCache || settings.noRevisionCache)
 	default:
@@ -3051,8 +3057,9 @@ func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision s
 	return gitClient, commitSHA, nil
 }
 
-func (s *Service) newOCIClientResolveRevision(ctx context.Context, repo *v1alpha1.Repository, revision string, noRevisionCache bool) (oci.Client, string, error) {
-	ociClient, err := s.newOCIClient(repo.Repo, repo.GetOCICreds(), repo.Proxy, repo.NoProxy, s.initConstants.OCIMediaTypes, s.ociClientStandardOpts()...)
+func (s *Service) newOCIClientResolveRevision(ctx context.Context, repo *v1alpha1.Repository, revision string, noRevisionCache bool, opts ...oci.ClientOpts) (oci.Client, string, error) {
+	opts = append(s.ociClientStandardOpts(), opts...)
+	ociClient, err := s.newOCIClient(repo.Repo, repo.GetOCICreds(), repo.Proxy, repo.NoProxy, s.initConstants.OCIMediaTypes, opts...)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to initialize oci client: %w", err)
 	}

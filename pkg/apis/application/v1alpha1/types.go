@@ -223,6 +223,34 @@ type ApplicationSource struct {
 	// For example, with tagPrefix "component-b/" and targetRevision "1.0.*", tags like "component-b/1.0.0" and
 	// "component-b/1.0.1" are candidates, and the constraint resolves to "component-b/1.0.1".
 	TagPrefix string `json:"tagPrefix,omitempty" protobuf:"bytes,15,opt,name=tagPrefix"`
+	// OCI holds native OCI transport options, independent of the manifest rendering tool.
+	OCI *ApplicationSourceOCI `json:"oci,omitempty" protobuf:"bytes,16,opt,name=oci"`
+}
+
+// ApplicationSourceOCI contains options for native OCI sources.
+type ApplicationSourceOCI struct {
+	// LayerSelector selects exactly one layer from the artifact manifest.
+	LayerSelector *OCILayerSelector `json:"layerSelector,omitempty" protobuf:"bytes,1,opt,name=layerSelector"`
+}
+
+// OCILayerSelector matches layer descriptors by media type and exact annotation values.
+// At least one criterion is required. All specified criteria must match.
+type OCILayerSelector struct {
+	MediaType   string            `json:"mediaType,omitempty" protobuf:"bytes,1,opt,name=mediaType"`
+	Annotations map[string]string `json:"annotations,omitempty" protobuf:"bytes,2,rep,name=annotations"`
+}
+
+// IsZero reports whether no OCI transport options are configured.
+func (source *ApplicationSourceOCI) IsZero() bool {
+	return source == nil || source.LayerSelector == nil
+}
+
+func (source *ApplicationSourceOCI) Equals(other *ApplicationSourceOCI) bool {
+	if source.IsZero() || other.IsZero() {
+		return source.IsZero() && other.IsZero()
+	}
+	return source.LayerSelector.MediaType == other.LayerSelector.MediaType &&
+		maps.Equal(source.LayerSelector.Annotations, other.LayerSelector.Annotations)
 }
 
 // ApplicationSources contains list of required information about the sources of an application
@@ -367,7 +395,8 @@ func (source *ApplicationSource) IsZero() bool {
 			source.Helm.IsZero() &&
 			source.Kustomize.IsZero() &&
 			source.Directory.IsZero() &&
-			source.Plugin.IsZero()
+			source.Plugin.IsZero() &&
+			source.OCI.IsZero()
 }
 
 // GetNamespaceOrDefault gets the static namespace configured in the source. If none is configured, returns the given
@@ -4164,12 +4193,17 @@ func (source *ApplicationSource) Equals(other *ApplicationSource) bool {
 	if !source.Helm.Equals(other.Helm) {
 		return false
 	}
+	if !source.OCI.Equals(other.OCI) {
+		return false
+	}
 	sourceCopy := source.DeepCopy()
 	otherCopy := other.DeepCopy()
 	sourceCopy.Plugin = nil
 	otherCopy.Plugin = nil
 	sourceCopy.Helm = nil
 	otherCopy.Helm = nil
+	sourceCopy.OCI = nil
+	otherCopy.OCI = nil
 	return reflect.DeepEqual(sourceCopy, otherCopy)
 }
 

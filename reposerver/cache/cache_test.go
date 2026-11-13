@@ -178,6 +178,69 @@ func TestCache_GetAppDetails(t *testing.T) {
 	mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalSets: 1, ExternalGets: 4})
 }
 
+func TestCache_OCISelectors(t *testing.T) {
+	cache := NewCache(cacheutil.NewCache(cacheutil.NewInMemoryCache(time.Hour)), time.Minute, time.Minute, time.Second)
+	source := &v1alpha1.ApplicationSource{
+		RepoURL: "oci://example.com/bundle", Path: "manifests/dev", TargetRevision: "v1",
+		OCI: &v1alpha1.ApplicationSourceOCI{LayerSelector: &v1alpha1.OCILayerSelector{
+			MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+			Annotations: map[string]string{"config": "true", "environment": "dev"},
+		}},
+	}
+	key := manifestKey{Revision: "parent-manifest-digest", AppSource: source, ClusterInfo: &apiclient.ManifestRequest{}}
+	manifest := &CachedManifestResponse{ManifestResponse: &apiclient.ManifestResponse{Manifests: []string{"selected-dev-layer"}}}
+	require.NoError(t, cache.SetManifests(key, manifest))
+	require.NoError(t, cache.SetAppDetails(key.Revision, source, nil, &apiclient.RepoAppDetailsResponse{Type: "Directory"}, "", nil))
+	for _, tt := range []struct {
+		name     string
+		selector *v1alpha1.OCILayerSelector
+		hit      bool
+	}{
+		{name: "annotation insertion order", selector: &v1alpha1.OCILayerSelector{
+			MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+			Annotations: map[string]string{"environment": "dev", "config": "true"},
+		}, hit: true},
+		{name: "different annotation", selector: &v1alpha1.OCILayerSelector{
+			MediaType:   "application/vnd.oci.image.layer.v1.tar+gzip",
+			Annotations: map[string]string{"config": "true", "environment": "prod"},
+		}},
+		{name: "different media type", selector: &v1alpha1.OCILayerSelector{
+			MediaType:   "application/vnd.oci.image.layer.v1.tar",
+			Annotations: map[string]string{"config": "true", "environment": "dev"},
+		}},
+		{name: "selectorless"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			other := *source
+			other.OCI = nil
+			if tt.selector != nil {
+				other.OCI = &v1alpha1.ApplicationSourceOCI{LayerSelector: tt.selector}
+			}
+			otherKey := key
+			otherKey.AppSource = &other
+			result := &CachedManifestResponse{}
+			manifestErr := cache.GetManifests(otherKey, result)
+			details := &apiclient.RepoAppDetailsResponse{}
+			detailsErr := cache.GetAppDetails(key.Revision, &other, nil, details, "", nil)
+			if tt.hit {
+				require.NoError(t, manifestErr)
+				require.NoError(t, detailsErr)
+				assert.Equal(t, []string{"selected-dev-layer"}, result.ManifestResponse.Manifests)
+				assert.Equal(t, "Directory", details.Type)
+			} else {
+				require.ErrorIs(t, manifestErr, ErrCacheMiss)
+				require.ErrorIs(t, detailsErr, ErrCacheMiss)
+				require.NoError(t, cache.SetManifests(otherKey, &CachedManifestResponse{ManifestResponse: &apiclient.ManifestResponse{Manifests: []string{"other-layer"}}}))
+				require.NoError(t, cache.GetManifests(key, result))
+				assert.Equal(t, []string{"selected-dev-layer"}, result.ManifestResponse.Manifests)
+			}
+		})
+	}
+	assert.Equal(t, "oci://example.com/bundle", source.RepoURL)
+	assert.Equal(t, "v1", source.TargetRevision)
+	assert.Equal(t, "dev", source.OCI.LayerSelector.Annotations["environment"])
+}
+
 func TestAddCacheFlagsToCmd(t *testing.T) {
 	t.Parallel()
 	cache, err := AddCacheFlagsToCmd(&cobra.Command{})()
